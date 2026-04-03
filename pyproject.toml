@@ -1,0 +1,16 @@
+[project]
+dynamic = ['version']
+name = 'ghsa-cli'
+description = 'CLI for efficiently interacting with GitHub Security Advisories (GHSA)'
+license = 'MIT'
+requires-python = '>=3.14'
+requires = [
+    'urllib3>=2',
+]
+
+[project.scripts]
+ghsa-cli = "ghsa_cli:main"
+
+[build-system]
+requires = ['flit-core>=3.11,<4']
+build-backend = 'flit_core.buildapi'
