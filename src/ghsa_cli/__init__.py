@@ -16,7 +16,7 @@ from typing import NoReturn
 
 import urllib3
 
-__version__ = "2026.4.6"
+__version__ = "2026.4.6.1"
 
 HTTP = urllib3.PoolManager()
 DEBUG = False

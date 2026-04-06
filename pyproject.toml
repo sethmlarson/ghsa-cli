@@ -7,8 +7,9 @@ authors = [
     {name = 'Seth Larson', email = 'sethmichaellarson@gmail.com'}
 ]
 requires-python = '>=3.14'
-requires = [
+dependencies = [
     'urllib3>=2',
+    'rich',
 ]
 
 [project.scripts]
