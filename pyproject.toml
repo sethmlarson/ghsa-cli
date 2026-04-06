@@ -1,8 +1,11 @@
 [project]
-dynamic = ['version']
+dynamic = ['version', 'description']
 name = 'ghsa-cli'
-description = 'CLI for efficiently interacting with GitHub Security Advisories (GHSA)'
+readme = "README.md"
 license = 'MIT'
+authors = [
+    {name = 'Seth Larson', email = 'sethmichaellarson@gmail.com'}
+]
 requires-python = '>=3.14'
 requires = [
     'urllib3>=2',
