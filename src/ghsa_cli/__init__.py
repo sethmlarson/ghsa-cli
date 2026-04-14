@@ -2,6 +2,7 @@
 
 import argparse
 import datetime
+import decimal
 import json
 import os
 import re
@@ -12,6 +13,8 @@ import subprocess
 import webbrowser
 import rich.console
 import rich.table
+import csv
+import cvelib.cve_api
 from typing import NoReturn
 
 import urllib3
@@ -20,6 +23,49 @@ __version__ = "2026.4.6.1"
 
 HTTP = urllib3.PoolManager()
 DEBUG = False
+
+# Used in the arguments, but also the collector
+# for the 'list' command.
+LIST_POSSIBLE_COLUMNS = {
+    "id",
+    "title",
+    "state",
+    "age",
+    "coordinator",
+    "cvss",
+    "cve_state",
+    "cve_id",
+    "collaborators",
+}
+LIST_DEFAULT_COLUMNS = [
+    "id",
+    "cve_id",
+    "title",
+    "state",
+    "age",
+    "cvss",
+    "coordinator",
+]
+LIST_SORTABLE_COLUMNS = {
+    "cvss",
+    "age",
+}
+
+
+def CVE_API() -> cvelib.cve_api.CveApi:
+    try:
+        cve_username = os.environ["CVE_USERNAME"]
+        cve_shortname = os.environ["CVE_CNA"]
+        cve_api_key = os.environ["CVE_API_KEY"]
+    except KeyError as e:
+        error(f"Missing environment variables for CVE API credentials: {e.args[0]}")
+
+    api = cvelib.cve_api.CveApi(
+        username=cve_username,
+        org=cve_shortname,
+        api_key=cve_api_key,
+    )
+    return api
 
 
 def command_list(args: argparse.Namespace) -> None:
@@ -70,17 +116,19 @@ def command_list(args: argparse.Namespace) -> None:
             continue
         security_advisories.append(sec_adv)
 
-    table = rich.table.Table()
-    table.add_column("id")
-    table.add_column("title")
-    table.add_column("state")
-    table.add_column("age")
-    if coordinator is None:  # Only show coordinator if it's not filtered.
-        table.add_column("coordinator")
-    table.add_column("cvss")
+    possible_columns = LIST_POSSIBLE_COLUMNS.copy()
+    columns = list(args.columns) if args.columns else LIST_DEFAULT_COLUMNS
 
+    rows = []
     for sec_adv in security_advisories:
-        sec_adv_coordinators = ", ".join(
+        in_progress_row = {
+            "id": sec_adv["ghsa_id"],
+            "title": sec_adv["summary"][:50],
+            "state": sec_adv["state"],
+        }
+        in_progress_sort = {}
+
+        in_progress_row["coordinator"] = ", ".join(
             credit["login"]
             for credit in sec_adv["credits"]
             if credit["type"] == "coordinator"
@@ -94,24 +142,57 @@ def command_list(args: argparse.Namespace) -> None:
                 if cvss_score is not None:
                     sec_adv_cvss = str(cvss_score)
                     break
+        in_progress_row["cvss"] = sec_adv_cvss
+        in_progress_sort["cvss"] = -int(decimal.Decimal(sec_adv_cvss or 11.0) * 1000)
 
         created_at = parse_rfc3339(sec_adv["created_at"])
         closed_at_or_now = parse_rfc3339(sec_adv["closed_at"])
         if closed_at_or_now is None:
             closed_at_or_now = datetime.datetime.now(tz=datetime.timezone.utc)
         age = duration_as_days(closed_at_or_now - created_at)
+        in_progress_sort["age"] = -(closed_at_or_now - created_at).total_seconds()
+        in_progress_row["age"] = age
 
-        table.add_row(
-            sec_adv["ghsa_id"],
-            sec_adv["summary"][:50],
-            sec_adv["state"],
-            age,
-            *((sec_adv_coordinators,) if coordinator is None else ()),
-            sec_adv_cvss,
+        cve_id = sec_adv.get("cve_id", None) or ""
+        cve_state = ""
+        if cve_id:
+            cve_api = CVE_API()
+            resp = cve_api.show_cve_id(cve_id)
+            cve_state = resp["state"].lower()
+        in_progress_row["cve_id"] = cve_id
+        in_progress_row["cve_state"] = cve_state
+
+        sort_value = tuple(in_progress_sort[column] for column in args.sort or ())
+        rows.append(tuple(in_progress_row[col] for col in columns) + (sort_value,))
+
+    rows = [row[:-1] for row in sorted(rows, key=lambda row: row[-1])]
+
+    def format_table(columns: list[str], rows: list[tuple[str, ...]]):
+        table = rich.table.Table()
+        for column in columns:
+            table.add_column(column)
+        for row in rows:
+            table.add_row(*row)
+        console = rich.console.Console()
+        console.print(table)
+
+    def format_csv(columns: list[str], rows: list[tuple[str, ...]]):
+        writer = csv.writer(sys.stdout)
+        writer.writerow(columns)
+        for row in rows:
+            writer.writerow(row)
+
+    formatters = {
+        "table": format_table,
+        "csv": format_csv,
+    }
+    if args.format not in formatters:
+        error(
+            f"Unknown formatter {args.format!r}, possible "
+            f"formatters are: {', '.join(sorted(map(repr, formatters.keys())))}"
         )
-
-    console = rich.console.Console()
-    console.print(table)
+    formatter = formatters[args.format]
+    formatter(columns, rows)
 
 
 def command_credit(args: argparse.Namespace):
@@ -350,6 +431,18 @@ def main(argv: list[str] | None = None) -> int:
         "list", description="List GHSAs for a repository"
     )
     parser_list.add_argument(
+        "--columns",
+        help="Columns to display in results",
+        default=LIST_DEFAULT_COLUMNS,
+        nargs="+",
+    )
+    parser_list.add_argument(
+        "--sort", help="Sort results by these fields", default=["age"], nargs="+"
+    )
+    parser_list.add_argument(
+        "--format", help="Output format", default="table", choices=["table", "csv"]
+    )
+    parser_list.add_argument(
         "--coordinator", help="Filter to GHSAs being coordinated by this login"
     )
     parser_list.add_argument(
@@ -358,12 +451,6 @@ def main(argv: list[str] | None = None) -> int:
         nargs="+",
         choices=["draft", "triage", "closed", "published"],
         default=["triage", "draft"],
-    )
-    parser_list.add_argument(
-        "--sort",
-        help="Sort GHSAs by this field",
-        default="created",
-        choices=["created", "severity", "updated"],
     )
 
     # 'credit'

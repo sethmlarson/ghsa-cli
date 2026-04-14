@@ -5,7 +5,7 @@ and remediations with GitHub Security Advisories (GHSA).
 
 Install from PyPI (`python -m pip install ghsa-cli`) and
 authenticate using a `GH_TOKEN` environment variable within the shell
-session (`export GH_TOKEN="$(gh auth token)"`). Repository automatically
+session with a GitHub personal access token. Repository automatically
 resolves to the `upstream`/`origin` remote of the current working directory
 git repository or can be set manually via `GH_REPO` or `--repo`.
 
@@ -58,5 +58,43 @@ ghsa-cli list --coordinator me
 │ GHSA-xxxx-xxxx-xxxx │ ...   │ triage │ 10d  │ 6.5  │
 │ GHSA-xxxx-xxxx-xxxx │ ...   │ draft  │ 16d  │ 7.0  │
 │ GHSA-xxxx-xxxx-xxxx │ ...   │ draft  │ 21d  │ 2.0  │
+│ GHSA-xxxx-xxxx-xxxx │ ...   │ draft  │ 60d  │ 2.0  │
 └─────────────────────┴───────┴────────┴──────┴──────┘
+```
+
+**Prioritizing reports based on CVSS or age**
+
+```
+ghsa-cli list --sort cvss age
+
+┏━━━━━━━━━━━━━━━━━━━━━┳━━━━━━━┳━━━━━━━━┳━━━━━━┳━━━━━━┓
+┃ id                  ┃ title ┃ state  ┃ age  ┃ cvss ┃
+┡━━━━━━━━━━━━━━━━━━━━━╇━━━━━━━╇━━━━━━━━╇━━━━━━╇━━━━━━┩
+│ GHSA-xxxx-xxxx-xxxx │ ...   │ draft  │ 16d  │ 7.0  │
+│ GHSA-xxxx-xxxx-xxxx │ ...   │ triage │ 10d  │ 6.5  │
+│ GHSA-xxxx-xxxx-xxxx │ ...   │ draft  │ 60d  │ 2.0  │
+│ GHSA-xxxx-xxxx-xxxx │ ...   │ draft  │ 21d  │ 2.0  │
+└─────────────────────┴───────┴────────┴──────┴──────┘
+```
+
+**Creating reports and integrating with CVE APIs**
+
+CVE APIs require a CVE Services API key. Set
+the `CVE_USERNAME`, `CVE_CNA`, and `CVE_API_KEY`
+environment variables to access properties about CVE
+IDs and records.
+
+Use the `--columns` parameter with `list` to add
+additional columns to the report.
+
+```
+ghsa-cli list --state triage draft closed --columns id state cve_id cve_state
+
+┏━━━━━━━━━━━━━━━━━━━━━┳━━━━━━━━┳━━━━━━━━━━━━━━━━┳━━━━━━━━━━━┓
+┃ id                  ┃ state  ┃ cve_id         ┃ cve_state ┃
+┡━━━━━━━━━━━━━━━━━━━━━╇━━━━━━━━╇━━━━━━━━━━━━━━━━╇━━━━━━━━━━━┩
+│ GHSA-xxxx-xxxx-xxxx │ triage │                │           │
+│ GHSA-xxxx-xxxx-xxxx │ closed │ CVE-YYY-YYYY   │ published │
+│ GHSA-xxxx-xxxx-xxxx │ draft  │ CVE-YYY-YYYY   │ reserved  │
+└─────────────────────┴────────┴────────────────┴───────────┘
 ```
