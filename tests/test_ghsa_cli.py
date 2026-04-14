@@ -1,4 +1,5 @@
 import os
+import json
 
 import pytest
 import unittest.mock
@@ -185,3 +186,111 @@ def test_move_to_issue_no_close(mocker, gh_token: str, start_state):
         "https://github.com/owner/repo/issues/new"
         "?title=Report%20title&body=" + ("x" * 3000) + "..."
     )
+
+
+def test_cve_record(mocker, capsys, gh_token):
+    def mock_gh_request(_, url, **__):
+        resp = unittest.mock.Mock(status=200)
+        if (
+            url
+            == "https://api.github.com/repos/owner/repo/security-advisories/GHSA-xxxx-xxxx-xxxx"
+        ):
+            resp.json.return_value = {
+                "summary": "Report title",
+                "description": "Report description",
+                "cve_id": "CVE-1234-5678",
+                "cvss_severities": {
+                    "cvss_v4": {
+                        "score": 9.1,
+                        "vector_string": "CVSS:4.0/AV:N/AC:H/AT:P/PR:N/UI:N/VC:H/VI:H/VA:N/SC:N/SI:N/SA:N",
+                    }
+                },
+                "cwe_ids": ["CWE-416", "CWE-787"],
+                "cwes": [
+                    {"cwe_id": "CWE-416", "name": "Use-after-free"},
+                    {"cwe_id": "CWE-787", "name": "Out-of-bounds write"},
+                ],
+                "credits_detailed": [
+                    {
+                        "user": {
+                            "login": "example",
+                            "type": "User",
+                        },
+                        "type": "reporter",
+                        "state": "accepted",
+                    }
+                ],
+            }
+        elif url == "https://api.github.com/users/example":
+            resp.json.return_value = {
+                "login": "example",
+                "name": "Full Name",
+            }
+        else:
+            raise ValueError(f"Unknown URL: {url}")
+        return resp
+
+    gh_request = mocker.patch(
+        "ghsa_cli.gh_request", unittest.mock.Mock(wraps=mock_gh_request)
+    )
+
+    main(["--repo=owner/repo", "cve-record", "GHSA-xxxx-xxxx-xxxx"])
+
+    ghsa_url = "https://api.github.com/repos/owner/repo/security-advisories/GHSA-xxxx-xxxx-xxxx"
+    gh_request.assert_any_call("GET", ghsa_url, gh_token=gh_token)
+
+    assert gh_request.mock_calls == [
+        unittest.mock.call("GET", ghsa_url, gh_token=gh_token),
+        unittest.mock.call(
+            "GET", "https://api.github.com/users/example", gh_token=gh_token
+        ),
+    ]
+
+    captured = capsys.readouterr()
+    assert json.loads(captured.out) == {
+        "dataType": "CVE_RECORD",
+        "dataVersion": "5.2",
+        "cveMetadata": {"cveId": "CVE-1234-5678", "state": "PUBLISHED"},
+        "containers": {
+            "cna": {
+                "title": "Report title",
+                "affected": [],
+                "descriptions": [
+                    {"lang": "en", "value": "Report description", "supportingMedia": []}
+                ],
+                "problemTypes": [
+                    {
+                        "descriptions": [
+                            {"lang": "en", "cweId": "CWE-416", "type": "CWE"},
+                        ]
+                    },
+                    {
+                        "descriptions": [
+                            {"lang": "en", "cweId": "CWE-787", "type": "CWE"},
+                        ]
+                    },
+                ],
+                "references": [],
+                "metrics": [
+                    {
+                        "format": "CVSS",
+                        "scenarios": [{"lang": "en", "value": "GENERAL"}],
+                        "cvssV4_0": {
+                            "exploitMaturity": "NOT_DEFINED",
+                            "Safety": "NOT_DEFINED",
+                            "Automatable": "NOT_DEFINED",
+                            "Recovery": "NOT_DEFINED",
+                            "valueDensity": "NOT_DEFINED",
+                            "vulnerabilityResponseEffort": "NOT_DEFINED",
+                            "providerUrgency": "NOT_DEFINED",
+                            "version": "4.0",
+                            "baseScore": 9.1,
+                            "vectorString": "CVSS:4.0/AV:N/AC:H/AT:P/PR:N/UI:N/VC:H/VI:H/VA:N/SC:N/SI:N/SA:N",
+                        },
+                    }
+                ],
+                "credits": [{"type": "reporter", "value": "Full Name", "lang": "en"}],
+                "source": {"discovery": "UNKNOWN"},
+            }
+        },
+    }

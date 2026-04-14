@@ -215,6 +215,121 @@ def command_collaborators(args: argparse.Namespace) -> None:
     pass  # TODO
 
 
+def command_cve_record(args: argparse.Namespace) -> None:
+    """
+    Command which generates a CVE Record template which can be
+    loaded into the 'Source' tab of Vulnogram from a GHSA
+    to prepopulate many fields. Known values for 'affected'
+    projects can be added.
+    """
+    gh_token = args.gh_token
+    ghsa_url = f"https://api.github.com/repos/{args.repo_owner}/{args.repo_name}/security-advisories/{args.ghsa_id}"
+
+    resp = gh_request("GET", ghsa_url, gh_token=gh_token)
+    if resp.status >= 300:
+        error("Could not fetch GHSA")
+    ghsa_json = resp.json()
+
+    summary = ghsa_json["summary"]
+    description = ghsa_json["description"]
+    cve_id = ghsa_json["cve_id"]
+    credit_type_ghsa_to_cve = {
+        "reporter": "reporter",
+        "coordinator": "coordinator",
+        "remediation_developer": "remediation developer",
+        "remediation_reviewer": "remediation reviewer",
+        "remediation_verifier": "remediation verifier",
+        "analyst": "analyst",
+        "finder": "finder",
+    }
+    affects_repo_to_cve = {
+        "python/cpython": {
+            "vendor": "Python Software Foundation",
+            "product": "CPython",
+            "repo": "https://github.com/python/cpython",
+        },
+        "pypa/pip": {
+            "vendor": "Python Software Foundation",
+            "product": "pip",
+            "repo": "https://github.com/pypa/pip",
+        },
+    }
+    cwes_cve = [
+        {"descriptions": [{"lang": "en", "cweId": cwe_id, "type": "CWE"}]}
+        for cwe_id in ghsa_json["cwe_ids"]
+    ]
+    credits_cve = []
+    metrics_cve = []
+
+    for credit in ghsa_json["credits_detailed"]:
+        credit_type_cve = credit_type_ghsa_to_cve[credit["type"]]
+        credit_login = credit["user"]["login"]
+        resp = gh_request(
+            "GET", f"https://api.github.com/users/{credit_login}", gh_token=gh_token
+        )
+        if resp.status >= 300:
+            error(f"Could not fetch GitHub user: {credit_login}")
+        credit_name = resp.json()["name"].strip()
+        if not credit_name:
+            credit_name = credit_login
+        credits_cve.append(
+            {
+                "type": credit_type_cve,
+                "value": credit_name,
+                "lang": "en",
+            }
+        )
+
+    if "cvss_v4" in ghsa_json["cvss_severities"]:
+        ghsa_cvss_v4 = ghsa_json["cvss_severities"]["cvss_v4"]
+        metrics_cve.append(
+            {
+                "format": "CVSS",
+                "scenarios": [{"lang": "en", "value": "GENERAL"}],
+                "cvssV4_0": {
+                    "exploitMaturity": "NOT_DEFINED",
+                    "Safety": "NOT_DEFINED",
+                    "Automatable": "NOT_DEFINED",
+                    "Recovery": "NOT_DEFINED",
+                    "valueDensity": "NOT_DEFINED",
+                    "vulnerabilityResponseEffort": "NOT_DEFINED",
+                    "providerUrgency": "NOT_DEFINED",
+                    "version": "4.0",
+                    "baseScore": ghsa_cvss_v4["score"],
+                    "vectorString": ghsa_cvss_v4["vector_string"],
+                },
+            }
+        )
+
+    cve_record = {
+        "dataType": "CVE_RECORD",
+        "dataVersion": "5.2",
+        "cveMetadata": {"cveId": cve_id, "state": "PUBLISHED"},
+        "containers": {
+            "cna": {
+                "title": summary,
+                "affected": [],
+                "descriptions": [
+                    {"lang": "en", "value": description, "supportingMedia": []}
+                ],
+                "problemTypes": cwes_cve,
+                "references": [],
+                "metrics": metrics_cve,
+                "credits": credits_cve,
+                "source": {"discovery": "UNKNOWN"},
+            }
+        },
+    }
+
+    if args.repo in affects_repo_to_cve:
+        affects_cve = affects_repo_to_cve[args.repo].copy()
+        affects_cve["defaultStatus"] = "unaffected"
+        affects_cve["versions"] = [{"versionType": "python", "version": "0"}]
+        cve_record["containers"]["cna"]["affected"] = [affects_cve]
+
+    print(json.dumps(cve_record, indent=2))
+
+
 def main(argv: list[str] | None = None) -> int:
     if argv is None:
         argv = sys.argv[1:]
@@ -304,6 +419,12 @@ def main(argv: list[str] | None = None) -> int:
         "--codeowners", nargs="+", help="Paths to gather collaborators from CODEOWNERS"
     )
 
+    # 'cve-record'
+    parser_cve_record = subparsers.add_parser(
+        "cve-record", description="Generate a CVE record template from a GHSA"
+    )
+    parser_cve_record.add_argument("ghsa_id", help="GitHub Security Advisory ID")
+
     args = parser.parse_args(argv)
     args.gh_token = gh_token
     if args.debug:  # Enable debug logging early.
@@ -333,6 +454,7 @@ def main(argv: list[str] | None = None) -> int:
         "move-to-issue": command_move_to_issue,
         "move-to-pr": command_move_to_pr,
         "collaborators": command_collaborators,
+        "cve-record": command_cve_record,
     }
     command_func = command_funcs[args.command]
     command_func(args)
@@ -370,13 +492,17 @@ def resolve_default_repo() -> str | None:
     if proc.returncode != 0:
         return None
     remotes = dict(
-        re.findall(r"^([\w+])\s+((?:https?|ssh)://.+)$", proc.stdout.decode("utf-8"))
+        re.findall(
+            r"^(\w+)\s+((?:https?|ssh)://[^(\s]+)",
+            proc.stdout.decode("utf-8"),
+            re.MULTILINE,
+        )
     )
     for remote in ("upstream", "origin"):
         if remote not in remotes:
             continue
         remote_url = remotes[remote]
-        mat = re.search(r"/github\.com/([^/]+)/([^/\s]+)", remote_url)
+        mat = re.search(r"[@/]github\.com/([^/]+)/([^/\s]+)", remote_url)
         if mat:
             return f"{mat.group(1)}/{mat.group(2)}"
     else:
