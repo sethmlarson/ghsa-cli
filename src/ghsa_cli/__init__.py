@@ -11,6 +11,8 @@ import typing
 import urllib.parse
 import subprocess
 import webbrowser
+
+import requests.exceptions
 import rich.console
 import rich.table
 import csv
@@ -70,44 +72,25 @@ def CVE_API() -> cvelib.cve_api.CveApi:
 
 def command_list(args: argparse.Namespace) -> None:
     gh_token = args.gh_token
-    fields = {"per_page": "100"}
-    if args.state and len(args.state) == 1:
-        fields["state"] = args.state[0]
 
-    def iter_security_advisories():
-        url = (
-            f"https://api.github.com/repos/{args.repo_owner}/{args.repo_name}/security-advisories"
-            f"?{urllib.parse.urlencode(fields)}"
-        )
-        while True:
-            resp = gh_request("GET", url, gh_token=gh_token)
-            if resp.status == 404:
-                return
-            elif resp.status >= 300:
-                error(f"Could not fetch GHSAs: {resp.data[:300]}")
-
-            if not resp.json():
-                break
-            yield from resp.json()
-
-            link_re = re.compile(r"<([^>]+)>;\s+rel=\"([^\"]+)\"")
-            for link_url, link_rel in link_re.findall(resp.headers.get("Link", "")):
-                if link_rel == "next":
-                    url = link_url
-                    break
-            else:
-                break
-
+    # Apply filters on all security advisories.
+    security_advisories = []
     coordinator = None
     if args.coordinator:
         coordinator = resolve_default_gh_login(
             gh_login=args.coordinator,
             gh_token=gh_token,
         )
+    fields = {}
+    if args.state is not None and len(args.state) == 1:
+        fields["state"] = args.state[0]
 
-    # Apply filters on all security advisories.
-    security_advisories = []
-    for sec_adv in iter_security_advisories():
+    for sec_adv in iter_security_advisories(
+        repo_owner=args.repo_owner,
+        repo_name=args.repo_name,
+        fields=fields,
+        gh_token=gh_token,
+    ):
         if coordinator is not None and not any(
             credit["login"] == coordinator for credit in sec_adv["credits"]
         ):
@@ -194,6 +177,77 @@ def command_list(args: argparse.Namespace) -> None:
     formatter = formatters[args.format]
     formatter(columns, rows)
 
+
+def command_report(args: argparse.Namespace) -> None:
+    cve_api = CVE_API()
+    security_advisories = []
+    for security_advisory in iter_security_advisories(
+        repo_owner=args.repo_owner,
+        repo_name=args.repo_name,
+        gh_token=args.gh_token,
+    ):
+        cve_id = security_advisory.get("cve_id", None)
+        if cve_id:
+            try:
+                cve = cve_api.show_cve_record(cve_id)
+                security_advisory["cve_reserved_at"] = cve["cveMetadata"]["dateReserved"]
+                security_advisory["cve_published_at"] = cve["cveMetadata"]["datePublished"]
+                security_advisory["cve_updated_at"] = cve["cveMetadata"]["dateUpdated"]
+                security_advisory["cve_state"] = cve["cveMetadata"]["state"].lower()
+            except requests.exceptions.HTTPError:  # 404, not found.
+                cve = cve_api.show_cve_id(cve_id)
+                security_advisory["cve_reserved_at"] = cve["reserved"]
+                security_advisory["cve_state"] = cve["state"].lower()
+        security_advisories.append(security_advisory)
+
+    results = {}
+    for security_advisory in security_advisories:
+        dt = parse_rfc3339(security_advisory["created_at"])
+        if security_advisory["state"] == "closed":
+            if "cve_state" in security_advisory and security_advisory["cve_state"] == "published":
+                state = "published"
+            else:
+                state = "rejected"
+        elif security_advisory["state"] == "published":
+            state = "published"
+        elif security_advisory["state"] == "triage":
+            state = "triage"
+        elif security_advisory["state"] == "draft":
+            state = "draft"
+        else:
+            raise ValueError(f"Unknown advisory state {security_advisory['state']!r}")
+        results.setdefault(state, []).append(dt)
+
+    now = datetime.datetime.now(tz=datetime.timezone.utc)
+    table = rich.table.Table()
+    table.add_column("state")
+    table.add_column("all")
+    for i in range(13):
+        table.add_column(f"{(i+1) * 30}d{'+' if i == 12 else ''}")
+    for label, states in [
+        ("all", {"rejected", "published", "triage", "draft"}),
+        ("published", {"published"}),
+        ("rejected", {"rejected"}),
+        ("draft", {"draft"}),
+        ("triage", {"triage"}),
+    ]:
+        row = []
+        all_count = 0
+        for state in states:
+            all_count += len(results[state])
+        for i in range(13):
+            before = now - datetime.timedelta(days=30 * i)
+            after = now - datetime.timedelta(days=30 * (i+1))
+            if i == 12:
+                after = now - datetime.timedelta(weeks=1000)  # pre-computers.
+            count = 0
+            for state in states:
+                count += sum([(after <= dt <= before) for dt in results[state]])
+            row.append(str(count))
+        table.add_row(label, str(all_count), *row)
+
+    console = rich.console.Console()
+    console.print(table)
 
 def command_credit(args: argparse.Namespace):
     gh_token = args.gh_token
@@ -289,7 +343,43 @@ def command_move_to_issue(args: argparse.Namespace) -> None:
 
 
 def command_move_to_pr(args: argparse.Namespace) -> None:
-    pass  # TODO
+    gh_token = args.gh_token
+    ghsa_url = f"https://api.github.com/repos/{args.repo_owner}/{args.repo_name}/security-advisories/{args.ghsa_id}"
+
+    resp = gh_request("GET", ghsa_url, gh_token=gh_token)
+    if resp.status >= 300:
+        error("Could not fetch GHSA")
+
+    ghsa = resp.json()
+    if not (private_fork := ghsa.get("private_fork", None)):
+        error("No private fork on GHSA")
+
+    pr_url = private_fork["pulls_url"].replace("{/number}", f"/{args.pr}")
+    pr_resp = gh_request("GET", pr_url, gh_token=gh_token)
+    if pr_resp.status >= 300:
+        error(f"Could not fetch GHSA PR #{args.pr}")
+    pr_json = pr_resp.json()
+    print(json.dumps(pr_json, indent=2))
+
+    title = pr_json["title"]
+    description = pr_json["body"]
+    reviewer_users = [user["login"] for user in pr_json["requested_reviewers"]]
+    reviewer_teams = [team["slug"] for team in pr_json["requested_teams"]]
+    patch_url = pr_json["patch_url"]
+
+    # Truncate the description to avoid 'URI Too Long' errors.
+    max_description_len = 3000
+    if len(description) > max_description_len:
+        description = description[:max_description_len] + "..."
+
+    query_str = urllib.parse.urlencode(
+        (("title", summary), ("body", description)), quote_via=urllib.parse.quote
+    )
+    issue_url = (
+        f"https://github.com/{args.repo_owner}/{args.repo_name}/issues/new?{query_str}"
+    )
+
+    webbrowser.open(issue_url)
 
 
 def command_collaborators(args: argparse.Namespace) -> None:
@@ -350,13 +440,13 @@ def command_cve_record(args: argparse.Namespace) -> None:
         )
         if resp.status >= 300:
             error(f"Could not fetch GitHub user: {credit_login}")
-        credit_name = resp.json()["name"].strip()
+        credit_name = (resp.json().get("name", None) or "").strip()
         if not credit_name:
             credit_name = credit_login
         credits_cve.append(
             {
                 "type": credit_type_cve,
-                "value": credit_name,
+                "value": f"{credit_name} (https://github.com/{credit_login})",
                 "lang": "en",
             }
         )
@@ -497,6 +587,9 @@ def main(argv: list[str] | None = None) -> int:
         action="store_true",
         help="Do not close the GHSA report after opening an issue",
     )
+    parser_move_to_pr = subparsers.add_parser("move-to-pr", description="Move a GHSA report to a PR")
+    parser_move_to_pr.add_argument("ghsa_id", help="GitHub Security Advisory ID")
+    parser_move_to_pr.add_argument("--pr", type=int, default=1, help="Pull request number, defaults to 1")
 
     # 'collaborators'
     parser_collaborators = subparsers.add_parser(
@@ -511,6 +604,10 @@ def main(argv: list[str] | None = None) -> int:
         "cve-record", description="Generate a CVE record template from a GHSA"
     )
     parser_cve_record.add_argument("ghsa_id", help="GitHub Security Advisory ID")
+
+    parser_report = subparsers.add_parser(
+        "report", description="Generate a report of GHSA historical data"
+    )
 
     args = parser.parse_args(argv)
     args.gh_token = gh_token
@@ -542,17 +639,49 @@ def main(argv: list[str] | None = None) -> int:
         "move-to-pr": command_move_to_pr,
         "collaborators": command_collaborators,
         "cve-record": command_cve_record,
+        "report": command_report,
     }
     command_func = command_funcs[args.command]
     command_func(args)
     return 0
 
 
+def iter_security_advisories(repo_owner: str, repo_name: str, gh_token: str, fields: dict[str, str]|None=None):
+    fields = fields or {}
+    fields["per_page"] = "100"
+
+    url = (
+        f"https://api.github.com/repos/{repo_owner}/{repo_name}/security-advisories"
+        f"?{urllib.parse.urlencode(fields)}"
+    )
+    while True:
+        resp = gh_request("GET", url, gh_token=gh_token)
+        if resp.status == 404:
+            return
+        elif resp.status >= 300:
+            error(f"Could not fetch GHSAs: {resp.data[:300]}")
+
+        if not resp.json():
+            break
+        yield from resp.json()
+
+        link_re = re.compile(r"<([^>]+)>;\s+rel=\"([^\"]+)\"")
+        for link_url, link_rel in link_re.findall(resp.headers.get("Link", "")):
+            if link_rel == "next":
+                url = link_url
+                break
+        else:
+            break
+
+
 def parse_rfc3339(value: str | None) -> datetime.datetime | None:
     """Parse a GitHub date according to RFC 3339"""
     if not isinstance(value, str):
         return value
-    return datetime.datetime.strptime(value, "%Y-%m-%dT%H:%M:%S%z")
+    try:
+        return datetime.datetime.strptime(value, "%Y-%m-%dT%H:%M:%S.%f%z")
+    except ValueError:
+        return datetime.datetime.strptime(value, "%Y-%m-%dT%H:%M:%S%z")
 
 
 def duration_as_days(value: datetime.timedelta) -> str:
