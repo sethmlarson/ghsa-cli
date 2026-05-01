@@ -77,6 +77,22 @@ ghsa-cli list --sort cvss age
 └─────────────────────┴───────┴────────┴──────┴──────┘
 ```
 
+**Searching for reports based on text**
+
+Use the `search` command and supply text to
+search through advisory titles and descriptions.
+
+```
+ghsa-cli search crlf
+
+┏━━━━━━━━━━━━━━━━━━━━━┳━━━━━━━━┳━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━┓
+┃ id                  ┃ state  ┃ title                                             ┃
+┡━━━━━━━━━━━━━━━━━━━━━╇━━━━━━━━╇━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━┩
+│ GHSA-xxxx-xxxx-xxxx │ closed │ IMAP Protocol Command Injection (CRLF) in imaplib │
+│ GHSA-xxxx-xxxx-xxxx │ closed │ POP3 Protocol Command Injection (CRLF) in poplib  │
+└─────────────────────┴────────┴───────────────────────────────────────────────────┘
+```
+
 **Creating reports and integrating with CVE APIs**
 
 CVE APIs require a CVE Services API key. Set
@@ -97,4 +113,43 @@ ghsa-cli list --state triage draft closed --columns id state cve_id cve_state
 │ GHSA-xxxx-xxxx-xxxx │ closed │ CVE-YYY-YYYY   │ published │
 │ GHSA-xxxx-xxxx-xxxx │ draft  │ CVE-YYY-YYYY   │ reserved  │
 └─────────────────────┴────────┴────────────────┴───────────┘
+```
+
+**Creating a template CVE Record from a GHSA**
+
+The command `cve-record` will create a template
+CVE record from the information available in a GHSA
+for use with a program like Vulnogram. This makes
+creating a CVE record quick and transfers information
+like credits and CVSS automatically.
+
+```
+ghsa-cli cve-record GHSA-xxxx-yyyy-zzzz
+
+{
+  "dataType": "CVE_RECORD",
+  "dataVersion": "5.2",
+  "cveMetadata": {
+    "cveId": "CVE-YYYY-XXXX",
+    "state": "PUBLISHED"
+  },
+  "containers": {
+    "cna": {
+      "title": "...",
+      "affected": [
+        {
+          "vendor": "Python Software Foundation",
+          "product": "CPython",
+          "repo": "https://github.com/python/cpython",
+          "defaultStatus": "unaffected",
+          "versions": [
+            {
+              "versionType": "python",
+              "version": "0"
+            }
+          ],
+          "modules": []
+        }
+      ]
+...
 ```

@@ -1,5 +1,6 @@
 import os
 import json
+from textwrap import dedent
 
 import pytest
 import unittest.mock
@@ -193,7 +194,7 @@ def test_cve_record(mocker, capsys, gh_token):
         resp = unittest.mock.Mock(status=200)
         if (
             url
-            == "https://api.github.com/repos/owner/repo/security-advisories/GHSA-xxxx-xxxx-xxxx"
+            == "https://api.github.com/repos/python/cpython/security-advisories/GHSA-xxxx-xxxx-xxxx"
         ):
             resp.json.return_value = {
                 "summary": "Report title",
@@ -234,9 +235,9 @@ def test_cve_record(mocker, capsys, gh_token):
         "ghsa_cli.gh_request", unittest.mock.Mock(wraps=mock_gh_request)
     )
 
-    main(["--repo=owner/repo", "cve-record", "GHSA-xxxx-xxxx-xxxx"])
+    main(["--repo=python/cpython", "cve-record", "GHSA-xxxx-xxxx-xxxx"])
 
-    ghsa_url = "https://api.github.com/repos/owner/repo/security-advisories/GHSA-xxxx-xxxx-xxxx"
+    ghsa_url = "https://api.github.com/repos/python/cpython/security-advisories/GHSA-xxxx-xxxx-xxxx"
     gh_request.assert_any_call("GET", ghsa_url, gh_token=gh_token)
 
     assert gh_request.mock_calls == [
@@ -254,7 +255,21 @@ def test_cve_record(mocker, capsys, gh_token):
         "containers": {
             "cna": {
                 "title": "Report title",
-                "affected": [],
+                "affected": [
+                    {
+                        "defaultStatus": "unaffected",
+                        "modules": [],
+                        "product": "CPython",
+                        "repo": "https://github.com/python/cpython",
+                        "vendor": "Python Software Foundation",
+                        "versions": [
+                            {
+                                "version": "0",
+                                "versionType": "python",
+                            },
+                        ],
+                    }
+                ],
                 "descriptions": [
                     {"lang": "en", "value": "Report description", "supportingMedia": []}
                 ],
@@ -289,8 +304,55 @@ def test_cve_record(mocker, capsys, gh_token):
                         },
                     }
                 ],
-                "credits": [{"type": "reporter", "value": "Full Name", "lang": "en"}],
+                "credits": [
+                    {
+                        "type": "reporter",
+                        "value": "Full Name (https://github.com/example)",
+                        "lang": "en",
+                    }
+                ],
                 "source": {"discovery": "UNKNOWN"},
             }
         },
     }
+
+
+def test_command_search(mocker, capsys):
+    iter_security_advisories = mocker.patch("ghsa_cli.iter_security_advisories")
+    iter_security_advisories.return_value = [
+        {
+            "ghsa_id": "GHSA-1111-1111-1111",
+            "state": "closed",
+            "summary": "Unrelated advisory",
+            "description": "More unrelated text",
+        },
+        {
+            "ghsa_id": "GHSA-2222-2222-2222",
+            "state": "draft",
+            "summary": "More related advisory",
+            "description": "Text around baseb64.b64encode()",
+        },
+        {
+            "ghsa_id": "GHSA-3333-3333-3333",
+            "state": "triage",
+            "summary": "Most related advisory b64encode.",
+            "description": "Crash with baseb64.b64encode()",
+        },
+    ]
+
+    main(["search", "base64.b64encode crash"])
+
+    captured = capsys.readouterr()
+    assert (
+        captured.out.strip()
+        == (
+            """
+┏━━━━━━━━━━━━━━━━━━━━━┳━━━━━━━━┳━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━┓
+┃ id                  ┃ state  ┃ title                            ┃
+┡━━━━━━━━━━━━━━━━━━━━━╇━━━━━━━━╇━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━┩
+│ GHSA-3333-3333-3333 │ triage │ Most related advisory b64encode. │
+│ GHSA-2222-2222-2222 │ draft  │ More related advisory            │
+└─────────────────────┴────────┴──────────────────────────────────┘
+"""
+        ).strip()
+    )

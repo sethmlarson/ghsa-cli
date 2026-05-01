@@ -195,6 +195,85 @@ def command_list(args: argparse.Namespace) -> None:
     formatter(columns, rows)
 
 
+def command_report(args: argparse.Namespace) -> None:
+    cve_api = CVE_API()
+    security_advisories = []
+    for security_advisory in iter_security_advisories(
+        repo_owner=args.repo_owner,
+        repo_name=args.repo_name,
+        gh_token=args.gh_token,
+    ):
+        cve_id = security_advisory.get("cve_id", None)
+        if cve_id:
+            try:
+                cve = cve_api.show_cve_record(cve_id)
+                security_advisory["cve_reserved_at"] = cve["cveMetadata"][
+                    "dateReserved"
+                ]
+                security_advisory["cve_published_at"] = cve["cveMetadata"][
+                    "datePublished"
+                ]
+                security_advisory["cve_updated_at"] = cve["cveMetadata"]["dateUpdated"]
+                security_advisory["cve_state"] = cve["cveMetadata"]["state"].lower()
+            except requests.exceptions.HTTPError:  # 404, not found.
+                cve = cve_api.show_cve_id(cve_id)
+                security_advisory["cve_reserved_at"] = cve["reserved"]
+                security_advisory["cve_state"] = cve["state"].lower()
+        security_advisories.append(security_advisory)
+
+    results = {}
+    for security_advisory in security_advisories:
+        dt = parse_rfc3339(security_advisory["created_at"])
+        if security_advisory["state"] == "closed":
+            if (
+                "cve_state" in security_advisory
+                and security_advisory["cve_state"] == "published"
+            ):
+                state = "published"
+            else:
+                state = "rejected"
+        elif security_advisory["state"] == "published":
+            state = "published"
+        elif security_advisory["state"] == "triage":
+            state = "triage"
+        elif security_advisory["state"] == "draft":
+            state = "draft"
+        else:
+            raise ValueError(f"Unknown advisory state {security_advisory['state']!r}")
+        results.setdefault(state, []).append(dt)
+
+    now = datetime.datetime.now(tz=datetime.timezone.utc)
+    table = rich.table.Table()
+    table.add_column("state")
+    table.add_column("all")
+    for i in range(13):
+        table.add_column(f"{(i + 1) * 30}d{'+' if i == 12 else ''}")
+    for label, states in [
+        ("all", {"rejected", "published", "triage", "draft"}),
+        ("published", {"published"}),
+        ("rejected", {"rejected"}),
+        ("draft", {"draft"}),
+        ("triage", {"triage"}),
+    ]:
+        row = []
+        all_count = 0
+        for state in states:
+            all_count += len(results[state])
+        for i in range(13):
+            before = now - datetime.timedelta(days=30 * i)
+            after = now - datetime.timedelta(days=30 * (i + 1))
+            if i == 12:
+                after = now - datetime.timedelta(weeks=1000)  # pre-computers.
+            count = 0
+            for state in states:
+                count += sum([(after <= dt <= before) for dt in results[state]])
+            row.append(str(count))
+        table.add_row(label, str(all_count), *row)
+
+    console = rich.console.Console()
+    console.print(table)
+
+
 def command_credit(args: argparse.Namespace):
     gh_token = args.gh_token
     url = f"https://api.github.com/repos/{args.repo_owner}/{args.repo_name}/security-advisories/{args.ghsa_id}"
@@ -296,6 +375,55 @@ def command_collaborators(args: argparse.Namespace) -> None:
     pass  # TODO
 
 
+def command_search(args: argparse.Namespace) -> None:
+
+    def text_to_words(text: str) -> set[str]:
+        """Converts text into words to match with query"""
+        text = text.lower()
+        words_whitespace = re.split(r"\s+", text)
+        words_whitespace_trailing_nonalphanumeric = re.split(r"[^a-z0-9]*\s+", text)
+        words_alphanumeric = re.split(r"\W+", text)
+        words_alphanumeric2 = re.split(r"[^a-z0-9]+", text)
+        return (
+            set(words_alphanumeric)
+            | set(words_alphanumeric2)
+            | set(words_whitespace)
+            | set(words_whitespace_trailing_nonalphanumeric)
+        )
+
+    query_words = text_to_words(args.query)
+    security_advisories = []
+    for security_advisory in iter_security_advisories(
+        repo_owner=args.repo_owner,
+        repo_name=args.repo_name,
+        gh_token=args.gh_token,
+    ):
+        security_advisory_text = (
+            security_advisory["summary"] + " " + security_advisory["description"]
+        )
+        security_advisory_words = text_to_words(security_advisory_text)
+        query_score = len(security_advisory_words.intersection(query_words))
+        if query_score == 0:
+            continue
+        security_advisories.append((security_advisory, query_score))
+
+    table = rich.table.Table()
+    table.add_column("id")
+    table.add_column("state")
+    table.add_column("title")
+
+    security_advisories = sorted(security_advisories, key=lambda x: x[1], reverse=True)
+    for security_advisory, _ in security_advisories[:10]:
+        table.add_row(
+            security_advisory["ghsa_id"],
+            security_advisory["state"],
+            security_advisory["summary"][:100],
+        )
+
+    console = rich.console.Console()
+    console.print(table)
+
+
 def command_cve_record(args: argparse.Namespace) -> None:
     """
     Command which generates a CVE Record template which can be
@@ -333,6 +461,7 @@ def command_cve_record(args: argparse.Namespace) -> None:
             "vendor": "Python Software Foundation",
             "product": "pip",
             "repo": "https://github.com/pypa/pip",
+            "collectionURL": "https:/pypi.org/project/pip",
         },
     }
     cwes_cve = [
@@ -356,7 +485,7 @@ def command_cve_record(args: argparse.Namespace) -> None:
         credits_cve.append(
             {
                 "type": credit_type_cve,
-                "value": credit_name,
+                "value": f"{credit_name} (https://github.com/{credit_login})",
                 "lang": "en",
             }
         )
@@ -406,6 +535,7 @@ def command_cve_record(args: argparse.Namespace) -> None:
         affects_cve = affects_repo_to_cve[args.repo].copy()
         affects_cve["defaultStatus"] = "unaffected"
         affects_cve["versions"] = [{"versionType": "python", "version": "0"}]
+        affects_cve["modules"] = []
         cve_record["containers"]["cna"]["affected"] = [affects_cve]
 
     print(json.dumps(cve_record, indent=2))
@@ -498,6 +628,14 @@ def main(argv: list[str] | None = None) -> int:
         help="Do not close the GHSA report after opening an issue",
     )
 
+    parser_move_to_pr = subparsers.add_parser(
+        "move-to-pr", description="Move a GHSA report to a PR"
+    )
+    parser_move_to_pr.add_argument("ghsa_id", help="GitHub Security Advisory ID")
+    parser_move_to_pr.add_argument(
+        "--pr", type=int, default=1, help="Pull request number, defaults to 1"
+    )
+
     # 'collaborators'
     parser_collaborators = subparsers.add_parser(
         "collaborators", description="Add collaborators to a GHSA"
@@ -511,6 +649,16 @@ def main(argv: list[str] | None = None) -> int:
         "cve-record", description="Generate a CVE record template from a GHSA"
     )
     parser_cve_record.add_argument("ghsa_id", help="GitHub Security Advisory ID")
+
+
+    parser_report = subparsers.add_parser(
+        "report", description="Generate a report of GHSA historical data"
+    )
+
+    parser_search = subparsers.add_parser(
+        "search", description="Search GitHub Security Advisories using text"
+    )
+    parser_search.add_argument("query", type=str, help="Text query to search for")
 
     args = parser.parse_args(argv)
     args.gh_token = gh_token
@@ -542,11 +690,42 @@ def main(argv: list[str] | None = None) -> int:
         "move-to-pr": command_move_to_pr,
         "collaborators": command_collaborators,
         "cve-record": command_cve_record,
+        "report": command_report,
+        "search": command_search,
     }
     command_func = command_funcs[args.command]
     command_func(args)
     return 0
 
+
+def iter_security_advisories(
+    repo_owner: str, repo_name: str, gh_token: str, fields: dict[str, str] | None = None
+):
+    fields = fields or {}
+    fields["per_page"] = "100"
+
+    url = (
+        f"https://api.github.com/repos/{repo_owner}/{repo_name}/security-advisories"
+        f"?{urllib.parse.urlencode(fields)}"
+    )
+    while True:
+        resp = gh_request("GET", url, gh_token=gh_token)
+        if resp.status == 404:
+            return
+        elif resp.status >= 300:
+            error(f"Could not fetch GHSAs: {resp.data[:300]}")
+
+        if not resp.json():
+            break
+        yield from resp.json()
+
+        link_re = re.compile(r"<([^>]+)>;\s+rel=\"([^\"]+)\"")
+        for link_url, link_rel in link_re.findall(resp.headers.get("Link", "")):
+            if link_rel == "next":
+                url = link_url
+                break
+        else:
+            break
 
 def parse_rfc3339(value: str | None) -> datetime.datetime | None:
     """Parse a GitHub date according to RFC 3339"""
