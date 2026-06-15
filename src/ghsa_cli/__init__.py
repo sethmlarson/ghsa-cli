@@ -17,6 +17,7 @@ import csv
 import cvelib.cve_api
 from typing import NoReturn
 
+import requests.exceptions
 import urllib3
 
 __version__ = "2026.5.1"
@@ -538,6 +539,10 @@ def command_cve_record(args: argparse.Namespace) -> None:
         affects_cve["modules"] = []
         cve_record["containers"]["cna"]["affected"] = [affects_cve]
 
+        if args.repo == "python/cpython":
+            latest_major_minor = latest_python_version()
+            affects_cve["versions"][0]["lessThan"] = f"{latest_major_minor}.0"
+
     print(json.dumps(cve_record, indent=2))
 
 
@@ -650,7 +655,6 @@ def main(argv: list[str] | None = None) -> int:
     )
     parser_cve_record.add_argument("ghsa_id", help="GitHub Security Advisory ID")
 
-
     parser_report = subparsers.add_parser(
         "report", description="Generate a report of GHSA historical data"
     )
@@ -727,6 +731,7 @@ def iter_security_advisories(
         else:
             break
 
+
 def parse_rfc3339(value: str | None) -> datetime.datetime | None:
     """Parse a GitHub date according to RFC 3339"""
     if not isinstance(value, str):
@@ -800,6 +805,19 @@ def gh_request(
             print(f"[---] {method} {url}", file=sys.stderr)
         raise e
     return resp
+
+
+def latest_python_version() -> str:
+    """Helper function which returns the latest Python version ('3.16')"""
+    resp = HTTP.request("GET", "https://peps.python.org/api/release-cycle.json")
+    assert resp.status == 200
+    release_cycle = resp.json()
+
+    latest_major_minor = sorted(
+        release_cycle.keys(),
+        key=lambda rel: tuple(int(part) for part in re.split(r"[^0-9]+", rel)),
+    )[-1]
+    return latest_major_minor
 
 
 def error(message: str) -> NoReturn:

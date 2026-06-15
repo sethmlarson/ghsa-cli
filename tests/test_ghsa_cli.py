@@ -231,6 +231,9 @@ def test_cve_record(mocker, capsys, gh_token):
             raise ValueError(f"Unknown URL: {url}")
         return resp
 
+    latest_python_version = mocker.patch(
+        "ghsa_cli.latest_python_version", unittest.mock.Mock(wraps=lambda: "3.16")
+    )
     gh_request = mocker.patch(
         "ghsa_cli.gh_request", unittest.mock.Mock(wraps=mock_gh_request)
     )
@@ -246,6 +249,7 @@ def test_cve_record(mocker, capsys, gh_token):
             "GET", "https://api.github.com/users/example", gh_token=gh_token
         ),
     ]
+    assert latest_python_version.mock_calls == [unittest.mock.call()]
 
     captured = capsys.readouterr()
     assert json.loads(captured.out) == {
@@ -265,6 +269,7 @@ def test_cve_record(mocker, capsys, gh_token):
                         "versions": [
                             {
                                 "version": "0",
+                                "lessThan": "3.16.0",
                                 "versionType": "python",
                             },
                         ],
