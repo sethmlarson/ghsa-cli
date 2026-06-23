@@ -466,8 +466,12 @@ def command_cve_record(args: argparse.Namespace) -> None:
         },
     }
     cwes_cve = [
-        {"descriptions": [{"lang": "en", "cweId": cwe_id, "type": "CWE"}]}
-        for cwe_id in ghsa_json["cwe_ids"]
+        {
+            "descriptions": [
+                {"lang": "en", "cweId": cwe_id, "type": "CWE", "description": cwe_id}
+                for cwe_id in ghsa_json["cwe_ids"]
+            ]
+        }
     ]
     credits_cve = []
     metrics_cve = []

@@ -281,12 +281,18 @@ def test_cve_record(mocker, capsys, gh_token):
                 "problemTypes": [
                     {
                         "descriptions": [
-                            {"lang": "en", "cweId": "CWE-416", "type": "CWE"},
-                        ]
-                    },
-                    {
-                        "descriptions": [
-                            {"lang": "en", "cweId": "CWE-787", "type": "CWE"},
+                            {
+                                "lang": "en",
+                                "cweId": "CWE-416",
+                                "type": "CWE",
+                                "description": "CWE-416",
+                            },
+                            {
+                                "lang": "en",
+                                "cweId": "CWE-787",
+                                "type": "CWE",
+                                "description": "CWE-787",
+                            },
                         ]
                     },
                 ],
