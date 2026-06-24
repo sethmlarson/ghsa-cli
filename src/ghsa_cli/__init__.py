@@ -14,6 +14,7 @@ import webbrowser
 import rich.console
 import rich.table
 import csv
+import sqlite3
 import cvelib.cve_api
 from typing import NoReturn
 
@@ -75,30 +76,6 @@ def command_list(args: argparse.Namespace) -> None:
     if args.state and len(args.state) == 1:
         fields["state"] = args.state[0]
 
-    def iter_security_advisories():
-        url = (
-            f"https://api.github.com/repos/{args.repo_owner}/{args.repo_name}/security-advisories"
-            f"?{urllib.parse.urlencode(fields)}"
-        )
-        while True:
-            resp = gh_request("GET", url, gh_token=gh_token)
-            if resp.status == 404:
-                return
-            elif resp.status >= 300:
-                error(f"Could not fetch GHSAs: {resp.data[:300]}")
-
-            if not resp.json():
-                break
-            yield from resp.json()
-
-            link_re = re.compile(r"<([^>]+)>;\s+rel=\"([^\"]+)\"")
-            for link_url, link_rel in link_re.findall(resp.headers.get("Link", "")):
-                if link_rel == "next":
-                    url = link_url
-                    break
-            else:
-                break
-
     coordinator = None
     if args.coordinator:
         coordinator = resolve_default_gh_login(
@@ -108,7 +85,9 @@ def command_list(args: argparse.Namespace) -> None:
 
     # Apply filters on all security advisories.
     security_advisories = []
-    for sec_adv in iter_security_advisories():
+    for sec_adv in iter_security_advisories(
+        repo_owner=args.repo_owner, repo_name=args.repo_name, fields=fields
+    ):
         if coordinator is not None and not any(
             credit["login"] == coordinator for credit in sec_adv["credits"]
         ):
@@ -197,43 +176,19 @@ def command_list(args: argparse.Namespace) -> None:
 
 
 def command_report(args: argparse.Namespace) -> None:
-    cve_api = CVE_API()
-    security_advisories = []
-    for security_advisory in iter_security_advisories(
+    results = {}
+    for security_advisory in iter_advisories_and_cves(
         repo_owner=args.repo_owner,
         repo_name=args.repo_name,
         gh_token=args.gh_token,
     ):
-        cve_id = security_advisory.get("cve_id", None)
-        if cve_id:
-            try:
-                cve = cve_api.show_cve_record(cve_id)
-                security_advisory["cve_reserved_at"] = cve["cveMetadata"][
-                    "dateReserved"
-                ]
-                security_advisory["cve_published_at"] = cve["cveMetadata"][
-                    "datePublished"
-                ]
-                security_advisory["cve_updated_at"] = cve["cveMetadata"]["dateUpdated"]
-                security_advisory["cve_state"] = cve["cveMetadata"]["state"].lower()
-            except requests.exceptions.HTTPError:  # 404, not found.
-                cve = cve_api.show_cve_id(cve_id)
-                security_advisory["cve_reserved_at"] = cve["reserved"]
-                security_advisory["cve_state"] = cve["state"].lower()
-        security_advisories.append(security_advisory)
-
-    results = {}
-    for security_advisory in security_advisories:
         dt = parse_rfc3339(security_advisory["created_at"])
         if security_advisory["state"] == "closed":
-            if (
-                "cve_state" in security_advisory
-                and security_advisory["cve_state"] == "published"
-            ):
+            if security_advisory["cve"]["state"] == "published":
                 state = "published"
             else:
                 state = "rejected"
-        elif security_advisory["state"] == "published":
+        elif security_advisory["cve"]["state"] == "published":
             state = "published"
         elif security_advisory["state"] == "triage":
             state = "triage"
@@ -550,6 +505,102 @@ def command_cve_record(args: argparse.Namespace) -> None:
     print(json.dumps(cve_record, indent=2))
 
 
+def command_export(args: argparse.Namespace) -> None:
+    """Export GHSAs to another format"""
+
+    advisories_fields = {
+        "ghsa_id": "STRING",
+        "cve_id": "STRING",
+        "cve_state": "STRING",
+        "state": "STRING",
+        "summary": "STRING",
+        "description": "STRING",
+        "severity": "STRING",
+        "severity_cvss_v4": "FLOAT",
+        "created_at": "STRING",
+        "updated_at": "STRING",
+        "reserved_at": "STRING",
+        "published_at": "STRING",
+        "author": "STRING",
+    }
+    credits_fields = {
+        "ghsa_id": "STRING",
+        "login": "STRING",
+        "type": "STRING",
+        "state": "STRING",
+    }
+    db = sqlite3.connect(args.output)
+    db.execute(
+        "CREATE TABLE IF NOT EXISTS advisories ("
+        + ", ".join(f"{field} {type_}" for field, type_ in advisories_fields.items())
+        + ", UNIQUE(ghsa_id));"
+    )
+    db.execute(
+        "CREATE TABLE IF NOT EXISTS credits ("
+        + ", ".join(f"{field} {type_}" for field, type_ in credits_fields.items())
+        + ", UNIQUE(ghsa_id, login));"
+    )
+    for security_advisory in iter_advisories_and_cves(
+        repo_owner=args.repo_owner,
+        repo_name=args.repo_name,
+        gh_token=args.gh_token,
+    ):
+        try:
+            severity_cvss_v4 = security_advisory["cvss_severities"]["cvss_v4"]["score"]
+        except KeyError:
+            severity_cvss_v4 = None
+        try:
+            author = security_advisory["author"]["login"]
+        except TypeError, KeyError:
+            author = None
+
+        advisories_record = [
+            ("ghsa_id", security_advisory["ghsa_id"]),
+            ("cve_id", security_advisory["cve_id"]),
+            ("cve_state", security_advisory["cve"]["state"]),
+            ("state", security_advisory["state"]),
+            ("summary", security_advisory["summary"]),
+            ("description", security_advisory["description"]),
+            ("severity", security_advisory["severity"]),
+            ("severity_cvss_v4", severity_cvss_v4),
+            ("created_at", security_advisory["created_at"]),
+            ("updated_at", security_advisory["updated_at"]),
+            ("reserved_at", security_advisory["cve"]["reserved_at"]),
+            ("published_at", security_advisory["cve"]["published_at"]),
+            ("author", author),
+        ]
+        assert set(advisories_fields) == {k for k, _ in advisories_record}
+
+        upsert_values = ",".join(f"{k}=excluded.{k}" for k, _ in advisories_record)
+        db.execute(
+            "INSERT INTO advisories ("
+            f"{','.join(k for k, _ in advisories_record)} "
+            f") VALUES ({','.join('?' for _ in range(len(advisories_fields)))})"
+            f"ON CONFLICT (ghsa_id) DO UPDATE SET {upsert_values};",
+            tuple(v for _, v in advisories_record),
+        )
+
+        for credit in security_advisory["credits_detailed"]:
+            credits_record = [
+                ("ghsa_id", security_advisory["ghsa_id"]),
+                ("login", credit["user"]["login"]),
+                ("type", credit["type"]),
+                ("state", credit["state"]),
+            ]
+            assert set(credits_fields) == {k for k, _ in credits_record}
+
+            upsert_values = ",".join(f"{k}=excluded.{k}" for k, _ in credits_record)
+            db.execute(
+                "INSERT INTO credits ("
+                f"{','.join(k for k, _ in credits_record)} "
+                f") VALUES ({','.join('?' for _ in range(len(credits_record)))})"
+                f"ON CONFLICT (ghsa_id, login) DO UPDATE SET {upsert_values};",
+                tuple(v for _, v in credits_record),
+            )
+
+    db.commit()
+
+
 def main(argv: list[str] | None = None) -> int:
     if argv is None:
         argv = sys.argv[1:]
@@ -668,6 +719,11 @@ def main(argv: list[str] | None = None) -> int:
     )
     parser_search.add_argument("query", type=str, help="Text query to search for")
 
+    parser_export = subparsers.add_parser(
+        "export", description="Export GHSA data into another format"
+    )
+    parser_export.add_argument("--output", help="Path for output")
+
     args = parser.parse_args(argv)
     args.gh_token = gh_token
     if args.debug:  # Enable debug logging early.
@@ -700,6 +756,7 @@ def main(argv: list[str] | None = None) -> int:
         "cve-record": command_cve_record,
         "report": command_report,
         "search": command_search,
+        "export": command_export,
     }
     command_func = command_funcs[args.command]
     command_func(args)
@@ -707,7 +764,10 @@ def main(argv: list[str] | None = None) -> int:
 
 
 def iter_security_advisories(
-    repo_owner: str, repo_name: str, gh_token: str, fields: dict[str, str] | None = None
+    repo_owner: str,
+    repo_name: str,
+    gh_token: str,
+    fields: dict[str, str] | None = None,
 ):
     fields = fields or {}
     fields["per_page"] = "100"
@@ -734,6 +794,43 @@ def iter_security_advisories(
                 break
         else:
             break
+
+
+def iter_advisories_and_cves(
+    repo_owner: str, repo_name: str, gh_token: str, fields: dict[str, str] | None = None
+):
+    cve_api = CVE_API()
+
+    for security_advisory in iter_security_advisories(
+        repo_owner=repo_owner,
+        repo_name=repo_name,
+        gh_token=gh_token,
+        fields=fields,
+    ):
+        cve_id = security_advisory.get("cve_id", None)
+        cve_state = "unknown"
+        reserved_at = None
+        published_at = None
+        updated_at = None
+        if cve_id:
+            try:
+                cve = cve_api.show_cve_record(cve_id)
+                reserved_at = cve["cveMetadata"]["dateReserved"]
+                published_at = cve["cveMetadata"]["datePublished"]
+                updated_at = cve["cveMetadata"]["dateUpdated"]
+                cve_state = cve["cveMetadata"]["state"].lower()
+            except requests.exceptions.HTTPError:  # 404, not found.
+                cve = cve_api.show_cve_id(cve_id)
+                reserved_at = cve["reserved"]
+                cve_state = cve["state"].lower()
+
+        security_advisory["cve"] = {
+            "state": cve_state,
+            "reserved_at": reserved_at,
+            "published_at": published_at,
+            "updated_at": updated_at,
+        }
+        yield security_advisory
 
 
 def parse_rfc3339(value: str | None) -> datetime.datetime | None:

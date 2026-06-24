@@ -1,7 +1,6 @@
 import os
 import json
-from textwrap import dedent
-
+import sqlite3
 import pytest
 import unittest.mock
 
@@ -13,6 +12,17 @@ def gh_token():
     token = os.environ["GH_TOKEN"] = "gh-token"
     yield token
     os.environ.pop("GH_TOKEN")
+
+
+@pytest.fixture(autouse=True)
+def cve_api():
+    os.environ["CVE_CNA"] = "cve-cna"
+    os.environ["CVE_USERNAME"] = "cve-username"
+    os.environ["CVE_API_KEY"] = "cve-api-key"
+    yield
+    os.environ.pop("CVE_CNA")
+    os.environ.pop("CVE_USERNAME")
+    os.environ.pop("CVE_API_KEY")
 
 
 def test_help(capsys):
@@ -367,3 +377,110 @@ def test_command_search(mocker, capsys):
 """
         ).strip()
     )
+
+
+def test_command_export(mocker, tmp_path):
+    ghsa_id = "GHSA-abcd-efgh-ijkl"
+
+    def mock_gh_request(_, url, **__):
+        resp = unittest.mock.Mock(status=200)
+        resp.headers = {"content-type": "application/json"}
+        if (
+            url
+            == "https://api.github.com/repos/python/cpython/security-advisories?per_page=100"
+        ):
+            resp.json.return_value = [
+                {
+                    "ghsa_id": ghsa_id,
+                    "summary": "Report title",
+                    "description": "Report description",
+                    "cve_id": "CVE-1234-5678",
+                    "state": "closed",
+                    "author": {
+                        "login": "example1",
+                    },
+                    "severity": "CRITICAL",
+                    "cvss_severities": {
+                        "cvss_v4": {
+                            "score": 9.1,
+                            "vector_string": "CVSS:4.0/AV:N/AC:H/AT:P/PR:N/UI:N/VC:H/VI:H/VA:N/SC:N/SI:N/SA:N",
+                        }
+                    },
+                    "cwe_ids": ["CWE-416", "CWE-787"],
+                    "cwes": [
+                        {"cwe_id": "CWE-416", "name": "Use-after-free"},
+                        {"cwe_id": "CWE-787", "name": "Out-of-bounds write"},
+                    ],
+                    "created_at": "2020-01-01T00:00:00Z",
+                    "updated_at": "2020-01-02T00:00:00Z",
+                    "published_at": "2020-01-03T00:00:00Z",
+                    "credits_detailed": [
+                        {
+                            "user": {
+                                "login": "example1",
+                                "type": "User",
+                            },
+                            "type": "reporter",
+                            "state": "accepted",
+                        },
+                        {
+                            "user": {
+                                "login": "example2",
+                                "type": "User",
+                            },
+                            "type": "coordinator",
+                            "state": "pending",
+                        },
+                    ],
+                }
+            ]
+        else:
+            raise ValueError(f"Unknown URL: {url}")
+        return resp
+
+    def mock_show_cve_record(cve_id):
+        assert cve_id == "CVE-1234-5678"
+        return {
+            "cveMetadata": {
+                "dateReserved": "2026-06-17T21:40:50Z",
+                "datePublished": "2026-06-18T21:40:50Z",
+                "dateUpdated": "2026-06-19T21:40:50Z",
+                "state": "published",
+            }
+        }
+
+    mock_cve_client = unittest.mock.Mock()
+    mock_cve_client.show_cve_record = mock_show_cve_record
+
+    mocker.patch("ghsa_cli.gh_request", unittest.mock.Mock(wraps=mock_gh_request))
+    mock_cve_api = mocker.patch("ghsa_cli.CVE_API")
+    mock_cve_api.return_value = mock_cve_client
+
+    db_filepath = os.path.join(tmp_path, "ghsa.sqlite")
+    main(["--repo=python/cpython", "export", f"--output={db_filepath}"])
+
+    db = sqlite3.connect(db_filepath)
+    advisory_records = db.execute("SELECT * FROM advisories;").fetchall()
+    assert advisory_records == [
+        (
+            "GHSA-abcd-efgh-ijkl",
+            "CVE-1234-5678",
+            "published",
+            "closed",
+            "Report title",
+            "Report description",
+            "CRITICAL",
+            9.1,
+            "2020-01-01T00:00:00Z",
+            "2020-01-02T00:00:00Z",
+            "2026-06-17T21:40:50Z",
+            "2026-06-18T21:40:50Z",
+            "example1",
+        )
+    ]
+
+    credits_records = sorted(db.execute("SELECT * FROM credits;").fetchall())
+    assert credits_records == [
+        ("GHSA-abcd-efgh-ijkl", "example1", "reporter", "accepted"),
+        ("GHSA-abcd-efgh-ijkl", "example2", "coordinator", "pending"),
+    ]
