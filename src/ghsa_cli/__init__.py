@@ -86,7 +86,8 @@ def command_list(args: argparse.Namespace) -> None:
     # Apply filters on all security advisories.
     security_advisories = []
     for sec_adv in iter_security_advisories(
-        repo_owner=args.repo_owner, repo_name=args.repo_name, fields=fields
+        repo_owner=args.repo_owner, repo_name=args.repo_name, fields=fields,
+        gh_token=args.gh_token,
     ):
         if coordinator is not None and not any(
             credit["login"] == coordinator for credit in sec_adv["credits"]
@@ -173,6 +174,135 @@ def command_list(args: argparse.Namespace) -> None:
         )
     formatter = formatters[args.format]
     formatter(columns, rows)
+
+
+def command_volume(args: argparse.Namespace) -> None:
+    table = rich.table.Table()
+    table.add_column("range")
+    table.add_column("start")
+    table.add_column("opened")
+    table.add_column("reject")
+    table.add_column("cves")
+    table.add_column("closed")
+    table.add_column("end")
+    table.add_column("delta")
+
+    sec_advs = []
+    for security_advisory in iter_advisories_and_cves(
+        repo_owner=args.repo_owner,
+        repo_name=args.repo_name,
+        gh_token=args.gh_token,
+    ):
+        created_at = parse_rfc3339(security_advisory["created_at"])
+        closed_at = parse_rfc3339(security_advisory["closed_at"])
+
+        if security_advisory["state"] == "closed":
+            if security_advisory["cve"]["state"] == "published":
+                state = "cve"
+                closed_at = parse_rfc3339(security_advisory["cve"]["published_at"])
+            else:
+                state = "reject"
+        elif security_advisory["cve"]["state"] == "published":
+            state = "cve"
+            closed_at = parse_rfc3339(security_advisory["cve"]["published_at"])
+        elif security_advisory["state"] == "triage":
+            state = "open"
+        elif security_advisory["state"] == "draft":
+            state = "open"
+        else:
+            raise ValueError(f"Unknown advisory state {security_advisory['state']!r}")
+        sec_advs.append((state, created_at, closed_at))
+
+    now = datetime.datetime.now(tz=datetime.timezone.utc)
+    outside_range = now - datetime.timedelta(days=300)
+    currently_open = len([_ for (state, created_at, _) in sec_advs if created_at < outside_range and state == "open"])
+
+    for i in range(12, 0, -1):
+        range_start = (now - datetime.timedelta(days=i*30))
+        range_end = (now - datetime.timedelta(days=(i-1)*30))
+        range_ = range_start.date().strftime("%Y-%m-%d")
+        opened = 0
+        closed = 0
+        cve = 0
+        reject = 0
+        for (state, created_at, closed_at) in sec_advs:
+            if range_start <= created_at <= range_end:
+                opened += 1
+            if closed_at is not None and range_start <= closed_at <= range_end:
+                closed += 1
+                if state == "cve":
+                    cve += 1
+                else:
+                    reject += 1
+        now_open = currently_open + opened - closed
+        delta = f"{'+' if opened >= closed else ''}{opened-closed}"
+        row = (range_, str(currently_open),f"+{opened}",f"-{reject}",f"-{cve}",f"-{closed}",str(now_open), delta)
+        table.add_row(*row)
+        currently_open = now_open
+
+    console = rich.console.Console()
+    console.print(table)
+
+
+def command_activity(args: argparse.Namespace) -> None:
+    resp = HTTP.request("GET", "https://raw.githubusercontent.com/python/devguide/refs/heads/main/security/psrt.csv")
+    rows = csv.reader(resp.data.decode().splitlines())
+
+    login_details = {}
+    expect_activity = set()
+    for _, login, details in rows:
+        login = login.lower()
+        expect_activity.add(login)
+        if details:
+            login_details[login.lower()] = details
+
+    activity = {login: 0 for login in expect_activity}
+    greater_than_closed_at = (
+        datetime.datetime.now(tz=datetime.timezone.utc)
+        - datetime.timedelta(days=183)
+    )
+
+    for security_advisory in iter_advisories_and_cves(
+        repo_owner=args.repo_owner,
+        repo_name=args.repo_name,
+        gh_token=args.gh_token,
+    ):
+        completed = False
+        closed_at = parse_rfc3339(security_advisory["closed_at"])
+        if security_advisory["state"] == "closed":
+            if security_advisory["cve"]["state"] == "published":
+                closed_at = parse_rfc3339(security_advisory["cve"]["published_at"])
+            completed = True
+        elif security_advisory["cve"]["state"] == "published":
+            closed_at = parse_rfc3339(security_advisory["cve"]["published_at"])
+            completed = True
+
+        if not completed or closed_at is None or closed_at < greater_than_closed_at:
+            continue
+
+        logins_with_activity = set()
+        for credit in security_advisory["credits"]:
+            login = credit["login"].lower()
+            type_ = credit["type"]
+            if login not in expect_activity:
+                continue
+            if type_ in ("reporter", "coordinator", "remediation_reviewer", "remediation_developer"):
+                logins_with_activity.add(login)
+
+        for login in logins_with_activity:
+            if login not in expect_activity:
+                continue
+            activity[login] += 1
+
+    table = rich.table.Table()
+    table.add_column("login")
+    table.add_column("activity")
+    table.add_column("details")
+    for login, count in sorted(activity.items()):
+        details = login_details.get(login, "")
+        table.add_row(login, str(count), details)
+    console = rich.console.Console()
+    console.print(table)
 
 
 def command_report(args: argparse.Namespace) -> None:
@@ -714,6 +844,16 @@ def main(argv: list[str] | None = None) -> int:
         "report", description="Generate a report of GHSA historical data"
     )
 
+    # 'volume'
+    parser_volume = subparsers.add_parser(
+        "volume", description="Calculate rates of opening and closing tickets"
+    )
+
+    # 'activity'
+    parser_activity = subparsers.add_parser(
+        "activity", description="Calculate members who have been active"
+    )
+
     parser_search = subparsers.add_parser(
         "search", description="Search GitHub Security Advisories using text"
     )
@@ -755,6 +895,8 @@ def main(argv: list[str] | None = None) -> int:
         "collaborators": command_collaborators,
         "cve-record": command_cve_record,
         "report": command_report,
+        "volume": command_volume,
+        "activity": command_activity,
         "search": command_search,
         "export": command_export,
     }
@@ -837,7 +979,10 @@ def parse_rfc3339(value: str | None) -> datetime.datetime | None:
     """Parse a GitHub date according to RFC 3339"""
     if not isinstance(value, str):
         return value
-    return datetime.datetime.strptime(value, "%Y-%m-%dT%H:%M:%S%z")
+    try:
+        return datetime.datetime.strptime(value, "%Y-%m-%dT%H:%M:%S%z")
+    except ValueError:  # Try with milliseconds, too.
+        return datetime.datetime.strptime(value, "%Y-%m-%dT%H:%M:%S.%f%z")
 
 
 def duration_as_days(value: datetime.timedelta) -> str:
